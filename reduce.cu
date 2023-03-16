@@ -67,6 +67,9 @@ void ReduceByTwoPass(const float* input, float* output, size_t n) {
   TwoPassSimpleKernel<<<1, thread_num_per_block, shm_size>>>(part, output, block_num);
 }
 
+
+
+// warp divergence
 __global__ void TwoPassInterleavedKernel(const float* input, float* part_sum,
                                          size_t n) {
   int32_t gtid = blockIdx.x * blockDim.x + threadIdx.x;  // global thread index
@@ -108,6 +111,78 @@ void ReduceByTwoPassInterleaved(const float* input, float* output, size_t n) {
   TwoPassInterleavedKernel<<<1, thread_num_per_block, shm_size>>>(part, output, block_num);
 }
 
+__global__ void baselineKernel(const float* input, float* part_sum,
+                                         size_t n) {
+  int32_t gtid = blockIdx.x * blockDim.x + threadIdx.x;  // global thread index
+  int32_t total_thread_num = gridDim.x * blockDim.x;
+  float sum = 0.0f;
+  for (int32_t i = gtid; i < n; i += total_thread_num) {
+    sum += input[i];
+  }
+  // store sum to shared memory
+  extern __shared__ float shm[];
+  shm[threadIdx.x] = sum;
+  __syncthreads();
+  // reduce shm to part_sum
+  for(unsigned int s=1; s<blockDim.x; s*=2){
+    if(threadIdx.x%(2*s) == 0){
+        shm[threadIdx.x]+=shm[threadIdx.x+s];
+    }
+    __syncthreads();
+  }
+    
+ if (threadIdx.x == 0) part_sum[blockIdx.x] = shm[0];
+}
+
+void ReduceByBaseline(const float* input, float* output, size_t n) {
+  const int32_t thread_num_per_block = 1024;  // tuned
+  const int32_t block_num = 1024;             // tuned
+  float *part = NULL;
+  cudaMalloc((void**)&part,(1024*sizeof(float)));
+  // the first pass reduce input[0:n] to part[0:block_num]
+  // part_sum[i] stands for the result of i-th block
+  size_t shm_size = thread_num_per_block * sizeof(float);  // float per thread
+  baselineKernel<<<block_num, thread_num_per_block, shm_size>>>(input,part, n);
+  // the second pass reduce part[0:block_num] to output
+  baselineKernel<<<1, thread_num_per_block, shm_size>>>(part, output, block_num);
+}
+
+__global__ void warpBranchKernel(const float* input, float* part_sum,
+                                         size_t n) {
+  int32_t gtid = blockIdx.x * blockDim.x + threadIdx.x;  // global thread index
+  int32_t total_thread_num = gridDim.x * blockDim.x;
+  float sum = 0.0f;
+  for (int32_t i = gtid; i < n; i += total_thread_num) {
+    sum += input[i];
+  }
+  // store sum to shared memory
+  extern __shared__ float shm[];
+  shm[threadIdx.x] = sum;
+  __syncthreads();
+  // reduce shm to part_sum
+  for(unsigned int s=1; s<blockDim.x; s*=2){
+    int index = 2*s*threadIdx.x;
+    if(index < blockDim.x){
+        shm[index]+=shm[index+s];
+    }
+    __syncthreads();
+}
+    
+ if (threadIdx.x == 0) part_sum[blockIdx.x] = shm[0];
+}
+
+void ReduceByWarpBranch(const float* input, float* output, size_t n) {
+  const int32_t thread_num_per_block = 1024;  // tuned
+  const int32_t block_num = 1024;             // tuned
+  float *part = NULL;
+  cudaMalloc((void**)&part,(1024*sizeof(float)));
+  // the first pass reduce input[0:n] to part[0:block_num]
+  // part_sum[i] stands for the result of i-th block
+  size_t shm_size = thread_num_per_block * sizeof(float);  // float per thread
+  warpBranchKernel<<<block_num, thread_num_per_block, shm_size>>>(input,part, n);
+  // the second pass reduce part[0:block_num] to output
+  warpBranchKernel<<<1, thread_num_per_block, shm_size>>>(part, output, block_num);
+}
 
 __global__ void TwoPassSharedOptimizedKernel(const float* input,
                                              float* part_sum, size_t n) {
@@ -134,6 +209,15 @@ __global__ void TwoPassSharedOptimizedKernel(const float* input,
     }
     __syncthreads();
   }
+  //   Shared Memory 有 4 字节模式和 8 字节模式：
+  // 4 字节模式：其中属于 Bank 0 的地址有 [0, 4), [128, 132), [256, 260)...，而属于 Bank 1 的地址有 [4, 8), [132, 136), [260, 264) ...，依次类推每个 bank 的地址。
+  // 8 字节模式：其中属于 Bank 0 的地址有 [0, 8), [256, 264), [512, 520)...，而属于 Bank 1 的地址有 [8, 16), [264, 272), [520, 528) ...，依次类推每个 bank 的地址。
+  //   Bank  |      1      |      2      |      3      |...
+  // Address |  0  1  2  3 |  4  5  6  7 |  8  9 10 11 |...
+  // Address | 64 65 66 67 | 68 69 70 71 | 72 73 74 75 |...
+  //    
+  // 0 + 4 , 1 + 5, 2 + 6 3 + 7
+  // 0 + 2 , 1 + 3   
   if (threadIdx.x == 0) {
     part_sum[blockIdx.x] = shm[0];
   }
@@ -178,6 +262,10 @@ int main()
     ReduceByAtomic(input, output, 4*1024*1024);
 
     ReduceByTwoPassInterleaved(input, output, 4*1024*1024);
+
+    ReduceByBaseline(input, output, 4*1024*1024);
+
+    ReduceByWarpBranch(input, output, 4*1024*1024);
 
     ReduceByTwoPassSharedOptimized(input, output, 4*1024*1024);
 
