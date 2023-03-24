@@ -43,8 +43,21 @@ __global__ void  kernel3( )
 }
 int main(void )
 {
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    cudaEventRecord(start);
     kernel1<<<1,1>>>();
     kernel2<<<2,2>>>();
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    float elapsed_time;
+    cudaEventElapsedTime(&elapsed_time, start, stop);
+    printf("Elapsed time:  %.2f  ms.\n", elapsed_time);
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+
     kernel3<<<1,2>>>();
     printf("host add = %d", add(1,1));
     cudaError_t err = cudaGetLastError();
